@@ -32,11 +32,6 @@ concurrency:
 
 env:
   SOURCE_REPO: romankuznetsov/temp-00000001-staging
-  # Used only for their signing tools (apk, usign, mkhash, ipkg-make-index.sh).
-  # Keep in step with temp-00000001-staging's build matrix; any SDK of the same
-  # OpenWrt release signs identically.
-  APK_SDK: 25.12.5
-  IPK_SDK: 24.10.8
 
 jobs:
   sign:
@@ -81,6 +76,18 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ steps.src.outputs.tag }}
+
+      # The SDK images provide only the signing tools. Their tags are read from
+      # the same map the source's build matrix uses, so they never drift from
+      # what built the packages. The image tag is x86_64-<release version>.
+      - name: Resolve the SDK tags from the source
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -eu
+          map=.github/openwrt-targets.json
+          echo "APK_SDK=x86_64-$(jq -r '."25.12".version' "$map")" >> "$GITHUB_ENV"
+          echo "IPK_SDK=x86_64-$(jq -r '."24.10".version' "$map")" >> "$GITHUB_ENV"
+          grep 'SDK=' "$GITHUB_ENV"
 
       - name: Download the published packages
         if: steps.gate.outputs.go == 'true'
