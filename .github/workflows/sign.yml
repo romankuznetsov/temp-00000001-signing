@@ -1,0 +1,218 @@
+# Signs and publishes the qWDTT feed for temp-00000001-staging.
+#
+# temp-00000001-staging builds the packages and publishes them to its release
+# page. The packages are never signed individually - only the feed index is,
+# and a router trusts a package by the hash the signed index records for it.
+# That index signing is done here, with the project's keys, which live in this
+# repository rather than the main one so they can be rotated or relocated on
+# their own.
+#
+# This downloads exactly the packages the main repository published, builds the
+# index over those files, signs it, and serves the signed feed from this
+# repository's Pages. Nothing is rebuilt and nothing is swapped: the bytes
+# signed here are the bytes temp-00000001-staging published, which anyone can
+# confirm by downloading both and comparing.
+---
+name: Sign and publish feed
+
+on:
+  schedule:
+    # Watches the source repository's releases; no trigger reaches here from it.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: feed
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: romankuznetsov/temp-00000001-staging
+  # Used only for their signing tools (apk, usign, mkhash, ipkg-make-index.sh).
+  # Keep in step with temp-00000001-staging's build matrix; any SDK of the same
+  # OpenWrt release signs identically.
+  APK_SDK: 25.12.5
+  IPK_SDK: 24.10.8
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Resolve the latest source release
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(gh release view --repo "$SOURCE_REPO" --json tagName -q .tagName)
+          test -n "$tag" || { echo "no release on $SOURCE_REPO"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "latest source release: $tag"
+
+      # The deployed feed records the tag it was signed from, so a scheduled run
+      # that finds nothing new does nothing rather than re-sign and redeploy.
+      - name: Skip if this tag is already signed
+        id: gate
+        run: |
+          set -eu
+          url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/signed-tag.txt"
+          have=$(curl -fsSL "$url" 2>/dev/null || echo "")
+          if [ "$have" = "${{ steps.src.outputs.tag }}" ]; then
+            echo "already signed $have"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have='$have' want='${{ steps.src.outputs.tag }}'"
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # For keys/ and the page generator; the trust anchor stays the source
+      # repository's, so this signs against the keys it already publishes.
+      - name: Check out the source at that tag
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.src.outputs.tag }}
+
+      - name: Download the published packages
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p dist
+          gh release download "${{ steps.src.outputs.tag }}" \
+            --repo "$SOURCE_REPO" --dir dist \
+            --pattern '*.apk' --pattern '*.ipk'
+          ls -l dist
+
+      # The same layout temp-00000001-staging's feed job builds, derived from
+      # the published filenames: an architecture's client plus the two noarch
+      # luci packages in each release's directory, so one feed URL serves a
+      # router everything. A file belongs to an architecture if its name carries
+      # that pkgarch; a noarch package carries none.
+      - name: Assemble the feed
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -eu
+          arches=$(ls dist | sed -n 's/^qwdtt-client_[^_]*_\(.*\)\.ipk$/\1/p' | sort -u)
+          test -n "$arches" || { echo "no client .ipk in the release"; exit 1; }
+          echo "arches: $(echo $arches | tr '\n' ' ')"
+          noarch() {  # file -> true when its name names no architecture
+            for a in $arches; do case "$1" in *"$a"*) return 1 ;; esac; done
+            return 0
+          }
+          for k in $arches; do
+            mkdir -p "site/releases/25.12/$k" "site/releases/24.10/$k"
+            for f in dist/*.apk; do
+              case "$f" in *"$k"*) cp "$f" "site/releases/25.12/$k/" ;; esac
+            done
+            for f in dist/*.ipk; do
+              case "$f" in *"$k"*) cp "$f" "site/releases/24.10/$k/" ;; esac
+            done
+            for f in dist/luci-*.apk; do noarch "$f" && cp "$f" "site/releases/25.12/$k/" || true; done
+            for f in dist/luci-*.ipk; do noarch "$f" && cp "$f" "site/releases/24.10/$k/" || true; done
+          done
+          find site -type f \( -name '*.apk' -o -name '*.ipk' \) | sort
+
+      # apk verifies the index and trusts the packages by the hashes in it, so
+      # signing packages.adb is what makes them installable without
+      # --allow-untrusted. Same command and key handling as the source
+      # repository's feed job.
+      - name: Sign the apk index
+        if: steps.gate.outputs.go == 'true'
+        env:
+          APK_PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+        run: |
+          set -eu
+          test -n "$APK_PRIVATE_KEY" || { echo "APK_PRIVATE_KEY is not set"; exit 1; }
+          docker run --rm --user 0:0 -e APK_PRIVATE_KEY \
+            -v "$PWD:/w" -w /w "ghcr.io/openwrt/sdk:${APK_SDK}" \
+            sh -c 'umask 077
+                   printf "%s\n" "$APK_PRIVATE_KEY" > /tmp/key.pem
+                   for d in /w/site/releases/25.12/*; do
+                     ( cd "$d" && /builder/staging_dir/host/bin/apk mkndx \
+                         --allow-untrusted --sign /tmp/key.pem \
+                         --output packages.adb *.apk ) || exit 1
+                   done'
+          sudo chown -R "$(id -u):$(id -g)" site
+          find site -name packages.adb -exec ls -l {} \;
+
+      - name: Sign the opkg index
+        if: steps.gate.outputs.go == 'true'
+        env:
+          IPK_PRIVATE_KEY: ${{ secrets.IPK_PRIVATE_KEY }}
+        run: |
+          set -eu
+          test -n "$IPK_PRIVATE_KEY" || { echo "IPK_PRIVATE_KEY is not set"; exit 1; }
+          docker run --rm --user 0:0 -e IPK_PRIVATE_KEY \
+            -v "$PWD:/w" -w /w "ghcr.io/openwrt/sdk:${IPK_SDK}" \
+            sh -c 'set -e
+                   ( umask 077; printf "%s\n" "$IPK_PRIVATE_KEY" > /tmp/key-build )
+                   export MKHASH=/builder/staging_dir/host/bin/mkhash
+                   for d in /w/site/releases/24.10/*; do
+                     ( cd "$d" && /builder/scripts/ipkg-make-index.sh . > Packages &&
+                       gzip -9nc Packages > Packages.gz &&
+                       /builder/staging_dir/host/bin/usign \
+                         -S -m Packages -s /tmp/key-build -x Packages.sig ) || exit 1
+                   done'
+          sudo chown -R "$(id -u):$(id -g)" site
+          find site -name 'Packages*' -exec ls -l {} \;
+
+      # The whole promise: the index verifies against the public keys the source
+      # repository publishes. If this passes, a router that trusts them installs
+      # without --allow-untrusted.
+      - name: Verify against the published public keys
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -eu
+          cp keys/qwdtt.pem site/qwdtt.pem
+          cp keys/qwdtt-usign.pub site/qwdtt-usign.pub
+          docker run --rm -v "$PWD:/w" -w /w "ghcr.io/openwrt/sdk:${APK_SDK}" \
+            sh -c 'mkdir -p /tmp/k && cp /w/keys/qwdtt.pem /tmp/k/
+                   for i in /w/site/releases/25.12/*/packages.adb; do
+                     printf "%s: " "$i"
+                     /builder/staging_dir/host/bin/apk verify --keys-dir /tmp/k "$i" || exit 1
+                   done'
+          docker run --rm -v "$PWD:/w" -w /w "ghcr.io/openwrt/sdk:${IPK_SDK}" \
+            sh -c 'u=/builder/staging_dir/host/bin/usign
+                   for i in /w/site/releases/24.10/*/Packages; do
+                     printf "%s: " "$i"
+                     $u -V -m "$i" -p /w/keys/qwdtt-usign.pub -x "$i.sig" && echo OK || exit 1
+                   done'
+
+      - name: Record the signed tag
+        if: steps.gate.outputs.go == 'true'
+        run: echo "${{ steps.src.outputs.tag }}" > site/signed-tag.txt
+
+      - name: Generate the site
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          .github/scripts/generate-feed-pages.sh site \
+            "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+
+      - name: Build with Jekyll
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: site
+          destination: _site
+
+      - name: Upload the site
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Deploy to Pages
+        id: deploy
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/deploy-pages@v5
