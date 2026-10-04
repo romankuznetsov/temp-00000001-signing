@@ -16,9 +16,8 @@
 name: Sign and publish feed
 
 on:
-  schedule:
-    # Watches the source repository's releases; no trigger reaches here from it.
-    - cron: '*/15 * * * *'
+  # Run by hand after the source repository publishes a release; no trigger
+  # reaches here from it.
   workflow_dispatch:
 
 permissions:
@@ -52,8 +51,8 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "latest source release: $tag"
 
-      # The deployed feed records the tag it was signed from, so a scheduled run
-      # that finds nothing new does nothing rather than re-sign and redeploy.
+      # The deployed feed records the tag it was signed from, so a run that
+      # finds nothing new does nothing rather than re-sign and redeploy.
       - name: Skip if this tag is already signed
         id: gate
         run: |
